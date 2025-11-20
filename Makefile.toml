@@ -43,7 +43,11 @@ args = [
     "-device", "nvdimm,memdev=mem1,id=nv1,label-size=2M",
     "-object", "memory-backend-file,id=mem1,share=on,mem-path=nvdimm0,size=16M",
 
-    # Network configuration
+    # Network configuration e1000
+    "-device", "e1000,netdev=net0,id=e1000",
+    "-netdev", "user,id=net0,hostfwd=tcp::2222-:22",
+
+    # Network configuration rtl8139
     "-nic", "model=rtl8139,id=rtl8139,hostfwd=udp::1797-:1797,hostfwd=tcp::1797-:1797",
     "-object", "filter-dump,id=filter1,netdev=rtl8139,file=rtl8139.dump",
 
@@ -78,7 +82,11 @@ args = [
     #"-device", "nvdimm,memdev=mem1,id=nv1,label-size=2M",
     #"-object", "memory-backend-file,id=mem1,share=on,mem-path=nvdimm0,size=16M",
 
-    # Network configuration
+    # Network configuration e1000
+    "-device", "e1000,netdev=net0,id=e1000",
+    "-netdev", "user,id=net0,hostfwd=tcp::2222-:22",
+
+    # Network configuration rtl8139
     "-nic", "model=rtl8139,id=rtl8139,hostfwd=udp::1797-:1797",
     "-object", "filter-dump,id=filter1,netdev=rtl8139,file=rtl8139.dump",
 
@@ -115,7 +123,11 @@ args = [
     "-device", "nvdimm,memdev=mem1,id=nv1,label-size=2M",
     "-object", "memory-backend-file,id=mem1,share=on,mem-path=nvdimm0,size=16M",
 
-    # Network configuration
+    # Network configuration e1000
+    "-device", "e1000,netdev=net0,id=e1000",
+    "-netdev", "user,id=net0,hostfwd=tcp::2222-:22",
+
+    # Network configuration rtl8139
     "-nic", "model=rtl8139,id=rtl8139,hostfwd=udp::1797-:1797,hostfwd=tcp::1797-:1797",
     "-object", "filter-dump,id=filter1,netdev=rtl8139,file=rtl8139.dump",
 
