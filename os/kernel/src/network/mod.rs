@@ -12,6 +12,7 @@ use smoltcp::socket::{dhcpv4, dns, icmp, tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{DnsQueryType, HardwareAddress, IpAddress, IpCidr, IpEndpoint};
 use spin::{Once, RwLock};
+use crate::device::e1000::E1000;
 use crate::device::rtl8139::Rtl8139;
 use crate::process::process::Process;
 use crate::{pci_bus, process_manager, scheduler, timer};
@@ -39,16 +40,22 @@ pub enum SocketType {
 pub fn init() {
     SOCKETS.call_once(|| RwLock::new(SocketSet::new(Vec::new())));
 
-    let devices = pci_bus().search_by_ids(0x10ec, 0x8139);
-    if !devices.is_empty() {
+    let rtldevices = pci_bus().search_by_ids(0x10ec, 0x8139);
+    if !rtldevices.is_empty() {
         RTL8139.call_once(|| {
             info!("Found Realtek RTL8139 network controller");
-            let rtl8139 = Arc::new(Rtl8139::new(devices[0]));
+            let rtl8139 = Arc::new(Rtl8139::new(rtldevices[0]));
             info!("RTL8139 MAC address: [{}]", rtl8139.read_mac_address());
 
             Rtl8139::plugin(Arc::clone(&rtl8139));
             rtl8139
         });
+    }
+
+    let e1000_devices = pci_bus().search_by_ids(0x8086, 0x100e);
+    if !e1000_devices.is_empty() {
+        info!("Found Intel E1000 network controller");
+        let e1000 = Arc::new(E1000::new(e1000_devices[0]));
     }
 
     if let Some(rtl8139) = RTL8139.get() {
