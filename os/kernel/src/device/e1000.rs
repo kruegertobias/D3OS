@@ -8,24 +8,60 @@ use core::ops::BitOr;
 use x86_64::{structures::paging::{page::PageRange, Page, PageTableFlags}, VirtAddr};
 use pci_types::{CommandRegister, EndpointHeader};
 use crate::memory::vma::VmaType;
-
+use crate::device::e1000_register;
+use crate::device::e1000_register::E1000Register;
 use crate::pci_bus;
 use crate::process_manager;
 use crate::memory::PAGE_SIZE;
+use crate::memory::vmm::VirtualAddressSpace;
 use crate::process::process;
 use crate::syscall::sys_concurrent::sys_thread_sleep;
 
-const CTRL: u32 = 0x00000;
-const STATUS: u32 = 0x00008;
-const FCAL: u32 = 0x00028;
-const FCAH: u32 = 0x0002C;
-const FCT: u32 = 0x00030;
-const FCTTV: u32 = 0x00170;
-const EERD: u32 = 0x00014;
+const DESCRIPTOR_BUFFER_SIZE: usize = 2048;
+const NR_OF_DESCRIPTORS: usize = 256;
 
 pub struct E1000 {
-
+    mac: [u8; 6],
+    mmio_virt_addr: u64,
+    registers: E1000Register,
 }
+
+pub struct TxRing {
+    pub vaddr: *mut TxDesc,
+    pub paddr: u64,
+    pub count: usize,
+    pub len_bytes: usize
+}
+
+pub struct RxRing {
+    pub vaddr: *mut RxDesc,
+    pub paddr: u64,
+    pub count: usize,
+    pub len_bytes: usize
+}
+
+#[repr(C, packed)]
+pub struct TxDesc {
+    pub buffer_addr: u64, // Physische Adresse des Sendepuffers
+    pub length:      u16, // Länge des Pakets
+    pub cso:         u8,
+    pub cmd:         u8,  // EOP, IFCS, RS, ...
+    pub status:      u8,  // Wird von HW gesetzt
+    pub css:         u8,
+    pub special:     u16,
+}
+
+#[repr(C, packed)]
+pub struct RxDesc {
+    pub buffer_addr: u64,
+    pub length: u16,
+    pub checksum: u16,
+    pub status: u8,
+    pub errors: u8,
+    pub special: u16,
+}
+const RX_DESC_SIZE: usize = core::mem::size_of::<RxDesc>();
+const TX_DESC_SIZE: usize = core::mem::size_of::<TxDesc>();
 
 impl E1000 {
     pub fn new(pci_device: &RwLock<EndpointHeader>){
@@ -51,46 +87,35 @@ impl E1000 {
         let mmio_virt_addr = start_page.start_address().as_u64();
         info!("E1000 MMIO mapped at virtual address: {:#x}", mmio_virt_addr);
 
-        let ctrl = unsafe { mmio_read32(mmio_virt_addr, CTRL) };
+        let mut e1000register = E1000Register::new(mmio_virt_addr);
+
+        let ctrl = e1000register.read_ctrl();
         log::info!("E1000 CTRL: {:#010x}", ctrl);
 
-        let status = unsafe { mmio_read32(mmio_virt_addr, STATUS) };
+        let status = unsafe { e1000register.read_status() };
         log::info!("E1000 STATUS: {:#010x}", status);
 
-        // set reset bit CTRL.RST(26)
-        unsafe { mmio_write32(mmio_virt_addr, CTRL, ctrl | (1 << 26)) };
+        //set reset bit CTRL.RST(26)
+        e1000register.write_ctrl(ctrl | (1 << 26));
         //Flush
-        unsafe { mmio_read32(mmio_virt_addr, CTRL) };
+        e1000register.read_ctrl();
+        while e1000register.read_ctrl() & (1 << 26) != 0 {}
+
         udelay(5000);
 
-        // read MAC Adress from EEPROM
+        // read MAC Address from EEPROM
         let mac = read_mac_address(mmio_virt_addr);
         assert!(is_valid_mac(&mac));
         log::info!("MAC = {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
+        init_ctrl(&mut e1000register);
 
+        let rx_ring = init_receive_ring();
+        init_receive_register(&mut e1000register, &rx_ring);
 
-        init_ctrl(mmio_virt_addr);
-
-
-
-    }
-
-}
-unsafe fn mmio_read32(base: u64, offset: u32) -> u32 {
-    let addr = (base + offset as u64) as *const u32;
-    core::ptr::read_volatile(addr)
-}
-
-unsafe fn mmio_write32(base: u64, offset: u32, value: u32) {
-    let addr = (base + offset as u64) as *mut u32;
-    core::ptr::write_volatile(addr, value);
-}
-
-pub fn udelay(us: usize) {
-    for _ in 0..(us * 1000) {
-        core::hint::spin_loop();
+        let tx_ring = init_transmit_ring();
+        init_transmit_register(&mut e1000register, &tx_ring);
     }
 }
 
@@ -132,8 +157,8 @@ pub fn is_valid_mac(mac: &[u8; 6]) -> bool {
         (mac[0] & 1) == 0
 }
 
-pub fn init_ctrl(mmio_virt_addr: u64) {
-    let mut ctrl = unsafe { mmio_read32(mmio_virt_addr, CTRL) };
+pub fn init_ctrl(e1000register: &mut E1000Register) {
+    let mut ctrl = e1000register.read_ctrl();
     // CRTL.ASDE CRTL.SLU
     ctrl = ctrl | (1 << 5) | (1 << 6);
     //clear CTRL.LRST
@@ -150,11 +175,185 @@ pub fn init_ctrl(mmio_virt_addr: u64) {
     ctrl = ctrl & !(1 << 12);
     info!("E1000 CTRL: {:#010x}", ctrl);
 
-    unsafe { mmio_write32(mmio_virt_addr, CTRL, ctrl) };
 
+    e1000register.write_ctrl(ctrl);
     // clear FCAL FCAH FCT FCTTV
-    unsafe { mmio_write32(mmio_virt_addr, FCAL, 0x00000000) };
-    unsafe { mmio_write32(mmio_virt_addr, FCAH, 0x00000000) };
-    unsafe { mmio_write32(mmio_virt_addr, FCT, 0x00000000) };
-    unsafe { mmio_write32(mmio_virt_addr, FCTTV, 0x00000000) };
+    e1000register.write_fcal(0x00000000);
+    e1000register.write_fcah(0x00000000);
+    e1000register.write_fct(0x00000000);
+    e1000register.write_fcttv(0x00000000);
+
+}
+
+pub fn init_receive_ring() -> RxRing {
+    // Alloc receive ringbuffer and set to 0
+    let pages_ringbuffer = ((NR_OF_DESCRIPTORS * RX_DESC_SIZE) + PAGE_SIZE - 1) / PAGE_SIZE;
+    let kernel_process = process_manager().read().kernel_process().expect("No kernel process found!");
+    let vmm = &kernel_process.virtual_address_space;
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+    let ring_rx_range = vmm.kernel_alloc_map_identity(pages_ringbuffer as u64, flags, VmaType::KernelBuffer, "rx_ringbuffer");
+    let start = ring_rx_range.start.start_address().as_u64();
+    let base_addr = start as *mut RxDesc;
+    unsafe {
+        core::ptr::write_bytes(
+            base_addr as *mut u8,
+            0,
+            NR_OF_DESCRIPTORS * RX_DESC_SIZE,
+        );
+    }
+
+    // alloc buffer for every descriptor
+    let pages_buffer = (NR_OF_DESCRIPTORS * DESCRIPTOR_BUFFER_SIZE + PAGE_SIZE - 1) / PAGE_SIZE ;
+    let flags_buf = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+    let buf_range = vmm.kernel_alloc_map_identity(
+        pages_buffer as u64,
+        flags_buf,
+        VmaType::KernelBuffer,
+        "rx_buffers",
+    );
+    let buf_base_paddr = buf_range.start.start_address().as_u64();
+
+    //write every address in descriptor.buffer_addr
+    for i in 0..NR_OF_DESCRIPTORS {
+        let buf_paddr = buf_base_paddr + (i as u64) * (DESCRIPTOR_BUFFER_SIZE as u64);
+
+        unsafe {
+            let d = base_addr.add(i);
+
+            (*d).buffer_addr = buf_paddr;
+        }
+    }
+
+    RxRing {
+        vaddr: base_addr,
+        paddr: start,
+        count: NR_OF_DESCRIPTORS,
+        len_bytes: NR_OF_DESCRIPTORS * RX_DESC_SIZE
+    }
+}
+
+pub fn init_receive_register(e1000register: &mut E1000Register, rx_ring: &RxRing) {
+    let paddr = rx_ring.paddr;
+
+    let rdbal = (paddr & 0xFFFF_FFFF) as u32;
+    let rdbah = (paddr >> 32) as u32;
+
+    let rdlen = rx_ring.len_bytes as u32;
+    assert_eq!((rdlen & 0x7F), 0, "RDLEN must be 128-byte aligned");
+
+
+    // 1) Descriptor Ring Base + Length
+    e1000register.write_rdbal(rdbal);
+    e1000register.write_rdbah(rdbah);
+    e1000register.write_rdlen(rdlen);
+
+    // 2) Head / Tail initialisieren
+    e1000register.write_rdh(0);
+    e1000register.write_rdt((rx_ring.count - 1) as u32);
+
+    // 3) Receive Control Register
+    let rctl =
+        (1 << 1) |          // Receiver enable
+            (1 << 5) |         // Long Packet Enable
+                (1 << 15) |         // Broadcast Accept Mode
+                    (0b00 << 16);   // 2048 Byte Buffers (BSEX = 0)
+
+    e1000register.write_rctl(rctl);
+    // Flush
+    e1000register.read_rctl();
+}
+pub fn init_transmit_ring() -> TxRing {
+    // alloc for transmit ringbuffer
+    let pages_ringbuffer = ((NR_OF_DESCRIPTORS * TX_DESC_SIZE) + PAGE_SIZE - 1) / PAGE_SIZE;
+    info!("Pages Ringbuffer = {}", pages_ringbuffer);
+    let kernel_process = process_manager().read().kernel_process().expect("No kernel process found!");
+    let vmm = &kernel_process.virtual_address_space;
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+    let ring_tx_range = vmm.kernel_alloc_map_identity(pages_ringbuffer as u64, flags, VmaType::KernelBuffer, "tx_ringbuffer");
+    let start = ring_tx_range.start.start_address().as_u64();
+    let base_addr = start as *mut TxDesc;
+    unsafe {
+        core::ptr::write_bytes(
+            base_addr as *mut u8,
+            0,
+            NR_OF_DESCRIPTORS * TX_DESC_SIZE,
+        );
+    }
+    // alloc buffer for descriptors
+    let pages_buffers =  ((NR_OF_DESCRIPTORS * DESCRIPTOR_BUFFER_SIZE) + PAGE_SIZE - 1) / PAGE_SIZE;
+    info!("Pages TX Buffers = {}", pages_buffers);
+    let flags_buf = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+    let buf_range = vmm.kernel_alloc_map_identity(
+        pages_buffers as u64,
+        flags_buf,
+        VmaType::KernelBuffer,
+        "tx_buffers",
+    );
+    let buf_base_paddr = buf_range.start.start_address().as_u64();
+
+    // add pointer to every descriptor
+    for i in 0..NR_OF_DESCRIPTORS {
+        let buf_paddr = buf_base_paddr + (i as u64) * (DESCRIPTOR_BUFFER_SIZE as u64);
+
+        unsafe {
+            let d = base_addr.add(i);
+
+            (*d).buffer_addr = buf_paddr;
+        }
+    }
+
+    TxRing {
+        vaddr: base_addr,
+        paddr: start,
+        count: NR_OF_DESCRIPTORS,
+        len_bytes: NR_OF_DESCRIPTORS * TX_DESC_SIZE
+    }
+}
+
+pub fn init_transmit_register(e1000register: &mut E1000Register, tx: &TxRing) {
+    // 1) Descriptor Ring Base/Len
+    let paddr = tx.paddr;
+    let tdbal = (paddr & 0xFFFF_FFFF) as u32;
+    let tdbah = (paddr >> 32) as u32;
+
+    // TDLEN muss 128-Byte aligned sein (untere 7 Bits = 0)
+    let tdlen = tx.len_bytes as u32;
+    assert!((tdlen & 0x7F) == 0, "TDLEN must be 128-byte aligned");
+
+    e1000register.write_tdbal(tdbal);
+    e1000register.write_tdbah(tdbah);
+    e1000register.write_tdlen(tdlen);
+
+    // 2) Head/Tail initialisieren (nach Reset, vor EN)
+    e1000register.write_tdh(0);
+    e1000register.write_tdt(0);
+
+    let tctl = e1000register.read_tctl();
+    info!("E1000 TCTL: {:#010x}", tctl );
+
+    // 4) TCTL: EN=1, PSP=1
+    let tctl_val =
+        (1u32 << 1) |          // EN
+            (1u32 << 3);          // PSP
+    e1000register.write_tctl(tctl_val);
+    info!("E1000 TCTL: {:#010x}", tctl_val );
+
+    //Flush
+    e1000register.read_tctl();
+}
+
+unsafe fn mmio_read32(base: u64, offset: u32) -> u32 {
+    let addr = (base + offset as u64) as *const u32;
+    core::ptr::read_volatile(addr)
+}
+
+unsafe fn mmio_write32(base: u64, offset: u32, value: u32) {
+    let addr = (base + offset as u64) as *mut u32;
+    core::ptr::write_volatile(addr, value);
+}
+
+pub fn udelay(us: usize) {
+    for _ in 0..(us * 1000) {
+        core::hint::spin_loop();
+    }
 }
