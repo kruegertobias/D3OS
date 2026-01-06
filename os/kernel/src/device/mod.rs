@@ -11,3 +11,4 @@ pub mod pci;
 pub mod rtl8139;
 pub mod cpu;
 pub mod e1000;
+pub mod e1000_register;
