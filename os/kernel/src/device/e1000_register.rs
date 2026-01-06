@@ -32,7 +32,7 @@ impl E1000Register {
             fct: mmio_virt_addr + 0x00030,
             fcttv: mmio_virt_addr + 0x00170,
             eerd: mmio_virt_addr + 0x00014,
-            tdbal: mmio_virt_addr + 0x03804,
+            tdbal: mmio_virt_addr + 0x03800,
             tdbah: mmio_virt_addr + 0x03804,
             tdlen: mmio_virt_addr + 0x03808,
             tdh: mmio_virt_addr + 0x03810,
@@ -44,7 +44,7 @@ impl E1000Register {
             rdlen: mmio_virt_addr + 0x02808,
             rdh: mmio_virt_addr + 0x02810,
             rdt: mmio_virt_addr + 0x02818,
-            rctl: mmio_virt_addr + 0x02800
+            rctl: mmio_virt_addr + 0x00100
         }
     }
 
