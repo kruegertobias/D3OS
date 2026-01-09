@@ -24,6 +24,8 @@ pub struct E1000 {
     mac: [u8; 6],
     mmio_virt_addr: u64,
     registers: E1000Register,
+    rx_ring: RxRing,
+    tx_ring: TxRing
 }
 
 pub struct TxRing {
@@ -64,7 +66,7 @@ const RX_DESC_SIZE: usize = core::mem::size_of::<RxDesc>();
 const TX_DESC_SIZE: usize = core::mem::size_of::<TxDesc>();
 
 impl E1000 {
-    pub fn new(pci_device: &RwLock<EndpointHeader>){
+    pub fn new(pci_device: &RwLock<EndpointHeader>) -> Self {
         info!("Configuring PCI registers");
         let pci_config_space = pci_bus().config_space();
         let mut pci_device = pci_device.write();
@@ -116,6 +118,14 @@ impl E1000 {
 
         let tx_ring = init_transmit_ring();
         init_transmit_register(&mut e1000register, &tx_ring);
+
+        Self {
+            mac,
+            mmio_virt_addr,
+            registers: e1000register,
+            rx_ring,
+            tx_ring
+        }
     }
 }
 
