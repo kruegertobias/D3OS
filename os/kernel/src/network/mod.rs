@@ -55,7 +55,8 @@ pub fn init() {
     let e1000_devices = pci_bus().search_by_ids(0x8086, 0x100e);
     if !e1000_devices.is_empty() {
         info!("Found Intel E1000 network controller");
-        let e1000 = Arc::new(E1000::new(e1000_devices[0]));
+        let mut e1000 = E1000::new(e1000_devices[0]);
+        e1000.test_send();
     }
 
     if let Some(rtl8139) = RTL8139.get() {

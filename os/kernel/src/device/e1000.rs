@@ -1,4 +1,4 @@
-use log::info;
+use log::{info, warn};
 use spin::RwLock;
 use core::ops::BitOr;
 
@@ -125,6 +125,53 @@ impl E1000 {
             registers: e1000register,
             rx_ring,
             tx_ring
+        }
+    }
+
+    fn send_data(&self, data: *const u8, size: u32, eop: bool) {
+        if size as usize > DESCRIPTOR_BUFFER_SIZE {
+            panic!("E1000 send_data size exceeds descriptor buffer");
+        }
+        //load tail descriptor
+        let tail = self.registers.read_tdt() as usize;
+        let tx_desc = unsafe { &mut *self.tx_ring.vaddr.add(tail) };
+
+        let buffer_ptr = tx_desc.buffer_addr as *mut u8;
+        unsafe {
+            core::ptr::copy_nonoverlapping(data, buffer_ptr, size as usize);
+        }
+
+        //fill Descriptor
+        tx_desc.length = size as u16;
+        tx_desc.cmd = 0;
+        tx_desc.status = 0;
+        if eop {
+            tx_desc.cmd |= (1 << 0) | (1 << 1);
+        }
+
+        //increase tail descriptor
+        let next_tail = (tail + 1) % self.tx_ring.count;
+        self.registers.write_tdt(next_tail as u32);
+    }
+
+    pub fn send(&self, data: *const u8, length: usize) -> usize {
+        let mut sent = 0usize;
+
+        while sent < length {
+            let to_send = core::cmp::min(length - sent, DESCRIPTOR_BUFFER_SIZE);
+            let chunk_ptr = unsafe { data.add(sent) };
+            self.send_data(chunk_ptr, to_send as u32, to_send == (length - sent));
+            sent += to_send;
+        }
+
+        sent
+    }
+
+    pub fn test_send(&self) {
+        for _ in 0..4000 {
+            let payload = [0xFFu8; 2048];
+            let sent = self.send(payload.as_ptr(), payload.len());
+            info!("E1000 test_send: queued {} bytes", sent);
         }
     }
 }
@@ -266,8 +313,8 @@ pub fn init_receive_register(e1000register: &mut E1000Register, rx_ring: &RxRing
         (1 << 1) |          // Receiver enable
             (1 << 5) |         // Long Packet Enable
                 (1 << 15) |         // Broadcast Accept Mode
-                    (0b00 << 16);   // 2048 Byte Buffers (BSEX = 0)
-
+                    (1 << 6) |   // Loop Back Mode
+                        (0b00 << 16);  // 2048 Byte Buffers (BSEX = 0)
     e1000register.write_rctl(rctl);
     // Flush
     e1000register.read_rctl();
