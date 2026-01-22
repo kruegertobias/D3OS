@@ -1,10 +1,8 @@
+use alloc::vec::Vec;
 use log::{info, warn};
 use spin::RwLock;
 use core::ops::BitOr;
-
-
-
-
+use core::slice;
 use x86_64::{structures::paging::{page::PageRange, Page, PageTableFlags}, VirtAddr};
 use pci_types::{CommandRegister, EndpointHeader};
 use crate::memory::vma::VmaType;
@@ -25,7 +23,8 @@ pub struct E1000 {
     mmio_virt_addr: u64,
     registers: E1000Register,
     rx_ring: RxRing,
-    tx_ring: TxRing
+    tx_ring: TxRing,
+    rx_next: usize,
 }
 
 pub struct TxRing {
@@ -39,7 +38,7 @@ pub struct RxRing {
     pub vaddr: *mut RxDesc,
     pub paddr: u64,
     pub count: usize,
-    pub len_bytes: usize
+    pub len_bytes: usize,
 }
 
 #[repr(C, packed)]
@@ -70,7 +69,7 @@ impl E1000 {
         info!("Configuring PCI registers");
         let pci_config_space = pci_bus().config_space();
         let mut pci_device = pci_device.write();
-    
+
         // Enable bus master and memory space for MMIO register access
         pci_device.update_command(pci_config_space, |command| {
             command.bitor(CommandRegister::BUS_MASTER_ENABLE | CommandRegister::MEMORY_ENABLE)
@@ -78,7 +77,7 @@ impl E1000 {
 
         // read mmio base adress from bar0
         let bar0 = pci_device.bar(0, pci_bus().config_space()).expect("Failed to read base address!");
-        let (base_address, size) = bar0.unwrap_mem(); 
+        let (base_address, size) = bar0.unwrap_mem();
         info!("E1000 MMIO Base Address: {:#x}, Size: {:#x}", base_address, size);
 
         // map to virtual memory
@@ -124,7 +123,8 @@ impl E1000 {
             mmio_virt_addr,
             registers: e1000register,
             rx_ring,
-            tx_ring
+            tx_ring,
+            rx_next: 0,
         }
     }
 
@@ -167,8 +167,52 @@ impl E1000 {
         sent
     }
 
+    pub fn receive_packets(&mut self) -> Vec<Vec<u8>> {
+        let mut idx = self.rx_next; //aktuell zu verarbeitender deskriptor
+        let mut packets = Vec::new(); // zum speichern der pakete, ersetze mit Netzwerkstack bald
+        let mut buffer: Vec<u8> = Vec::new();  //
+
+        loop {
+            let rx_desc = unsafe { &mut *self.rx_ring.vaddr.add(idx) };
+            if (rx_desc.status & (1 << 0)) == 0 { //ist der deskriptor gefühlt?
+                break;
+            }
+
+            let eop = (rx_desc.status & (1 << 1)) != 0;
+            let len = rx_desc.length as usize;
+            let data_ptr = rx_desc.buffer_addr as *const u8;
+            let data = unsafe { slice::from_raw_parts(data_ptr, len) };
+
+            if buffer.is_empty() { //erster deskriptor des paketes?
+                buffer = Vec::with_capacity(len);
+            }
+            buffer.extend_from_slice(data);
+
+            rx_desc.status = 0;
+            idx = (idx + 1) % self.rx_ring.count;
+
+            if eop {
+                //Letzter Deskriptor des Paketes, push das paket zum netzwerkstack
+                packets.push(buffer);
+                buffer = Vec::new();
+            }
+        }
+
+        // setze rdt auf den letzten bearbeiteten Deskriptor
+        let tail = if idx == 0 {
+            self.rx_ring.count - 1
+        } else {
+            idx - 1
+        };
+        self.registers.write_rdt(tail as u32);
+        self.rx_next = idx;
+
+        packets
+    }
+
+
     pub fn test_send(&self) {
-        for _ in 0..4000 {
+        for _ in 0..1 {
             let payload = [0xFFu8; 2048];
             let sent = self.send(payload.as_ptr(), payload.len());
             info!("E1000 test_send: queued {} bytes", sent);
