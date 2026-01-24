@@ -11,7 +11,7 @@ use smoltcp::iface::{self, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::{dhcpv4, dns, icmp, tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{DnsQueryType, HardwareAddress, IpAddress, IpCidr, IpEndpoint};
-use spin::{Once, RwLock};
+use spin::{Mutex, Once, RwLock};
 use crate::device::e1000::E1000;
 use crate::device::rtl8139::Rtl8139;
 use crate::process::process::Process;
@@ -19,6 +19,8 @@ use crate::{pci_bus, process_manager, scheduler, timer};
 use crate::process::thread::Thread;
 
 static RTL8139: Once<Arc<Rtl8139>> = Once::new();
+static E1000_DEV: Once<Arc<Mutex<E1000>>> = Once::new();
+
 
 static INTERFACES: RwLock<Vec<Interface>> = RwLock::new(Vec::new());
 static SOCKETS: Once<RwLock<SocketSet>> = Once::new();
@@ -55,8 +57,13 @@ pub fn init() {
     let e1000_devices = pci_bus().search_by_ids(0x8086, 0x100e);
     if !e1000_devices.is_empty() {
         info!("Found Intel E1000 network controller");
-        let mut e1000 = E1000::new(e1000_devices[0]);
-        e1000.test_send();
+        E1000_DEV.call_once(|| {
+            info!("Found Intel E1000 network controller");
+            let e1000 = Arc::new(Mutex::new(E1000::new(e1000_devices[0])));
+            E1000::plugin(Arc::clone(&e1000));
+            e1000.lock().test_send();
+            e1000
+        });
     }
 
     if let Some(rtl8139) = RTL8139.get() {

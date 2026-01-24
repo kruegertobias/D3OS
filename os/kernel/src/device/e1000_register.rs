@@ -18,7 +18,10 @@ pub struct E1000Register {
     rdlen: u64,
     rdh: u64,
     rdt: u64,
-    rctl: u64
+    rctl: u64,
+    icr: u64,
+    ims: u64,
+    imc: u64,
 }
 
 
@@ -44,7 +47,10 @@ impl E1000Register {
             rdlen: mmio_virt_addr + 0x02808,
             rdh: mmio_virt_addr + 0x02810,
             rdt: mmio_virt_addr + 0x02818,
-            rctl: mmio_virt_addr + 0x00100
+            rctl: mmio_virt_addr + 0x00100,
+            icr: mmio_virt_addr + 0x000C0,
+            ims: mmio_virt_addr + 0x000D0,
+            imc: mmio_virt_addr + 0x000D8,
         }
     }
 
@@ -232,6 +238,20 @@ impl E1000Register {
         unsafe { core::ptr::write_volatile(self.rctl as *mut u32, val) }
     }
 
+    // ICR
+    pub fn read_icr(&self) -> u32 {
+        unsafe { core::ptr::read_volatile(self.icr as *const u32) }
+    }
+
+    // IMS
+    pub fn write_ims(&self, val: u32) {
+        unsafe { core::ptr::write_volatile(self.ims as *mut u32, val) }
+    }
+
+    // IMC
+    pub fn write_imc(&self, val: u32) {
+        unsafe { core::ptr::write_volatile(self.imc as *mut u32, val) }
+    }
 
 
 }

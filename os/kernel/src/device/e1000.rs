@@ -1,14 +1,20 @@
+use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use log::{info, warn};
-use spin::RwLock;
+use spin::{Mutex, RwLock};
 use core::ops::BitOr;
 use core::slice;
+use bitflags::bitflags;
 use x86_64::{structures::paging::{page::PageRange, Page, PageTableFlags}, VirtAddr};
 use pci_types::{CommandRegister, EndpointHeader};
 use crate::memory::vma::VmaType;
 use crate::device::e1000_register;
 use crate::device::e1000_register::E1000Register;
-use crate::pci_bus;
+use crate::device::rtl8139::Interrupt;
+use crate::interrupt::interrupt_dispatcher::InterruptVector;
+use crate::{apic, interrupt_dispatcher, pci_bus};
+use crate::interrupt::interrupt_handler::InterruptHandler;
 use crate::process_manager;
 use crate::memory::PAGE_SIZE;
 use crate::memory::vmm::VirtualAddressSpace;
@@ -25,7 +31,10 @@ pub struct E1000 {
     rx_ring: RxRing,
     tx_ring: TxRing,
     rx_next: usize,
+    interrupt: InterruptVector,
 }
+unsafe impl Send for E1000 {}
+
 
 pub struct TxRing {
     pub vaddr: *mut TxDesc,
@@ -64,6 +73,21 @@ pub struct RxDesc {
 const RX_DESC_SIZE: usize = core::mem::size_of::<RxDesc>();
 const TX_DESC_SIZE: usize = core::mem::size_of::<TxDesc>();
 
+bitflags! {
+    pub struct InterruptCause: u32 {
+        const TXDW = 0x00000001;
+        const TXQE = 0x00000002;
+        const LSC = 0x00000004;
+        const RXDMT0 = 0x00000010;
+        const RXO = 0x00000040;
+        const RXDW = 0x00000080;
+    }
+}
+
+pub struct E1000InterruptHandler {
+    device: Arc<Mutex<E1000>>,
+}
+
 impl E1000 {
     pub fn new(pci_device: &RwLock<EndpointHeader>) -> Self {
         info!("Configuring PCI registers");
@@ -79,6 +103,8 @@ impl E1000 {
         let bar0 = pci_device.bar(0, pci_bus().config_space()).expect("Failed to read base address!");
         let (base_address, size) = bar0.unwrap_mem();
         info!("E1000 MMIO Base Address: {:#x}, Size: {:#x}", base_address, size);
+
+        let interrupt = InterruptVector::try_from(pci_device.interrupt(pci_config_space).1 + 32).unwrap();
 
         // map to virtual memory
         let kernel_process = process_manager().read().kernel_process().expect("No kernel process found!");
@@ -118,6 +144,8 @@ impl E1000 {
         let tx_ring = init_transmit_ring();
         init_transmit_register(&mut e1000register, &tx_ring);
 
+        init_interrupt_registers(&e1000register);
+
         Self {
             mac,
             mmio_virt_addr,
@@ -125,6 +153,7 @@ impl E1000 {
             rx_ring,
             tx_ring,
             rx_next: 0,
+            interrupt,
         }
     }
 
@@ -206,16 +235,44 @@ impl E1000 {
         };
         self.registers.write_rdt(tail as u32);
         self.rx_next = idx;
+        
+        info!("{:?}", packets);
 
         packets
     }
 
 
+
+
     pub fn test_send(&self) {
-        for _ in 0..1 {
+        for _ in 0..2 {
             let payload = [0xFFu8; 2048];
             let sent = self.send(payload.as_ptr(), payload.len());
             info!("E1000 test_send: queued {} bytes", sent);
+        }
+    }
+
+    pub fn plugin(device: Arc<Mutex<E1000>>) {
+        let interrupt = device.lock().interrupt;
+        interrupt_dispatcher().assign(interrupt, Box::new(E1000InterruptHandler::new(device)));
+        apic().allow(interrupt);
+    }
+}
+
+impl E1000InterruptHandler {
+    pub fn new(device: Arc<Mutex<E1000>>) -> Self {
+        Self { device }
+    }
+}
+
+impl InterruptHandler for E1000InterruptHandler {
+    fn trigger(&self) {
+        if let Some(mut device) = self.device.try_lock() {
+            info!("E1000 interrupt handler triggered");
+            let status = InterruptCause::from_bits_retain(device.registers.read_icr());
+            if status.intersects(InterruptCause::RXDW | InterruptCause::RXO | InterruptCause::RXDMT0) {
+                device.receive_packets();
+            }
         }
     }
 }
@@ -251,6 +308,12 @@ pub fn read_mac_address(mmio_base: u64) -> [u8; 6] {
     ]
 }
 
+pub fn init_interrupt_registers(e1000register: &E1000Register) {
+    e1000register.write_imc(u32::MAX);
+    e1000register.read_icr();
+    let mask = (InterruptCause::RXDW | InterruptCause::RXO | InterruptCause::RXDMT0).bits();
+    e1000register.write_ims(mask);
+}
 
 pub fn is_valid_mac(mac: &[u8; 6]) -> bool {
     mac != &[0, 0, 0, 0, 0, 0] &&
