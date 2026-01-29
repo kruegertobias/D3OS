@@ -19,7 +19,7 @@ use crate::{pci_bus, process_manager, scheduler, timer};
 use crate::process::thread::Thread;
 
 static RTL8139: Once<Arc<Rtl8139>> = Once::new();
-static E1000_DEV: Once<Arc<Mutex<E1000>>> = Once::new();
+static E1000_DEV: Once<Arc<E1000>> = Once::new();
 
 
 static INTERFACES: RwLock<Vec<Interface>> = RwLock::new(Vec::new());
@@ -59,10 +59,55 @@ pub fn init() {
         info!("Found Intel E1000 network controller");
         E1000_DEV.call_once(|| {
             info!("Found Intel E1000 network controller");
-            let e1000 = Arc::new(Mutex::new(E1000::new(e1000_devices[0])));
+            let e1000 = Arc::new(E1000::new(e1000_devices[0]));
             E1000::plugin(Arc::clone(&e1000));
-            e1000.lock().test_send();
+            e1000.test_send();
             e1000
+        });
+    }
+
+    if let Some(e1000) = E1000_DEV.get() {
+        extern "sysv64" fn poll() {
+            loop { e1000_poll_sockets(); scheduler().sleep(50); }
+        }
+        scheduler().ready(Thread::new_kernel_thread(poll, "RTL8139"));
+
+        // Set up network interface
+        let time = timer().systime_ms();
+        let mut conf = iface::Config::new(HardwareAddress::from(e1000.mac_address()));
+        conf.random_seed = time as u64;
+
+        // The Smoltcp interface struct wants a mutable reference to the device.
+        // However, the RTL8139 driver is designed to work with shared references.
+        // Since smoltcp does not actually store the mutable reference anywhere,
+        // we can safely cast the shared reference to a mutable one.
+        // (Actually, I am not sure why the smoltcp interface wants a mutable reference to the device,
+        // since it does not modify the device itself.)
+        let device = unsafe { ptr::from_ref(e1000.deref()).cast_mut().as_mut().unwrap() };
+        add_interface(Interface::new(conf, device, Instant::from_millis(time as i64)));
+
+        let sockets = SOCKETS.get().expect("Socket set not initialized!");
+        let current_process = process_manager().read().current_process();
+        let mut process_map = SOCKET_PROCESS.write();
+        // setup DNS
+        DNS_SOCKET.call_once(|| {
+            let dns_socket = dns::Socket::new(&[], Vec::new());
+            let dns_handle = sockets.write().add(dns_socket);
+            process_map
+                .try_insert(dns_handle, current_process.clone())
+                .expect("failed to insert socket into socket-process map");
+            dns_handle
+        });
+        // request an IP address via DHCP
+        DHCP_SOCKET.call_once(|| {
+            let dhcp_socket = dhcpv4::Socket::new();
+            let dhcp_handle = sockets
+                .write()
+                .add(dhcp_socket);
+            process_map
+                .try_insert(dhcp_handle, current_process)
+                .expect("failed to insert socket into socket-process map");
+            dhcp_handle
         });
     }
 
@@ -366,6 +411,67 @@ fn poll_sockets() -> Option<()> {
     // Smoltcp expects a mutable reference to the device, but the RTL8139 driver is built
     // to work with a shared reference. We can safely cast the shared reference to a mutable.
     let device = unsafe { ptr::from_ref(rtl8139.deref()).cast_mut().as_mut().unwrap() };
+
+    let interface = interfaces.get_mut(0).expect("failed to get interface");
+    interface.poll(time, device, &mut sockets);
+    // DHCP handling is based on https://github.com/smoltcp-rs/smoltcp/blob/main/examples/dhcp_client.rs
+    let dhcp_handle = DHCP_SOCKET.get().expect("DHCP socket does not exist yet");
+    let dhcp_socket = sockets.get_mut::<dhcpv4::Socket>(*dhcp_handle);
+    if let Some(event) = dhcp_socket.poll() {
+        match event {
+            dhcpv4::Event::Deconfigured => {
+                info!("lost DHCP lease");
+                interface.update_ip_addrs(|addrs| addrs.clear());
+                interface.routes_mut().remove_default_ipv4_route();
+            },
+            dhcpv4::Event::Configured(config) => {
+                info!("acquired DHCP lease:");
+                info!("IP address: {}", config.address);
+                interface.update_ip_addrs(|addrs| {
+                    addrs.clear();
+                    addrs.push(IpCidr::Ipv4(config.address)).unwrap();
+                });
+
+                if let Some(router) = config.router {
+                    info!("default gateway: {router}");
+                    interface
+                        .routes_mut()
+                        .add_default_ipv4_route(router)
+                        .unwrap();
+                } else {
+                    info!("no default gateway");
+                    interface
+                        .routes_mut()
+                        .remove_default_ipv4_route();
+                }
+                info!("DNS servers: {:?}", config.dns_servers);
+                let dns_servers: Vec<_> = config.dns_servers
+                    .iter()
+                    .map(|ip| IpAddress::Ipv4(*ip))
+                    .collect();
+                let dns_handle = DNS_SOCKET.get().expect("DNS socket does not exist yet");
+                let dns_socket = sockets.get_mut::<dns::Socket>(*dns_handle);
+                dns_socket.update_servers(&dns_servers);
+            },
+        }
+    }
+    Some(())
+}
+
+/// Try to poll all sockets.
+///
+/// This returns None, if it failed to get all needed locks.
+/// This is needed, because we otherwise might get a deadlock, because an
+/// application has the lock on `sockets` while we have the lock on `interfaces`.
+fn e1000_poll_sockets() -> Option<()> {
+    let e1000 = E1000_DEV.get().expect("E1000 not initialized");
+    let mut interfaces = INTERFACES.try_write()?;
+    let mut sockets = SOCKETS.get().expect("Socket set not initialized!").try_write()?;
+    let time = Instant::from_millis(timer().systime_ms() as i64);
+
+    // Smoltcp expects a mutable reference to the device, but the RTL8139 driver is built
+    // to work with a shared reference. We can safely cast the shared reference to a mutable.
+    let device = unsafe { ptr::from_ref(e1000.deref()).cast_mut().as_mut().unwrap() };
 
     let interface = interfaces.get_mut(0).expect("failed to get interface");
     interface.poll(time, device, &mut sockets);

@@ -1,13 +1,19 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use log::{info, warn};
 use spin::{Mutex, RwLock};
 use core::ops::BitOr;
 use core::slice;
 use bitflags::bitflags;
+use nolock::queues::mpmc;
 use x86_64::{structures::paging::{page::PageRange, Page, PageTableFlags}, VirtAddr};
 use pci_types::{CommandRegister, EndpointHeader};
+use smoltcp::phy;
+use smoltcp::phy::{DeviceCapabilities, Medium};
+use smoltcp::time::Instant;
+use smoltcp::wire::EthernetAddress;
 use crate::memory::vma::VmaType;
 use crate::device::e1000_register;
 use crate::device::e1000_register::E1000Register;
@@ -23,6 +29,7 @@ use crate::syscall::sys_concurrent::sys_thread_sleep;
 
 const DESCRIPTOR_BUFFER_SIZE: usize = 2048;
 const NR_OF_DESCRIPTORS: usize = 256;
+const RECV_QUEUE_CAP: usize = 64;
 
 pub struct E1000 {
     mac: [u8; 6],
@@ -32,8 +39,8 @@ pub struct E1000 {
     tx_ring: TxRing,
     rx_next: usize,
     interrupt: InterruptVector,
+    recv_messages: (mpmc::bounded::scq::Receiver<Vec<u8>>, mpmc::bounded::scq::Sender<Vec<u8>>),
 }
-unsafe impl Send for E1000 {}
 
 
 pub struct TxRing {
@@ -154,6 +161,7 @@ impl E1000 {
             tx_ring,
             rx_next: 0,
             interrupt,
+            recv_messages: mpmc::bounded::scq::queue(RECV_QUEUE_CAP),
         }
     }
 
@@ -224,7 +232,10 @@ impl E1000 {
 
             if eop {
                 //Letzter Deskriptor des Paketes, push das paket zum netzwerkstack
-                packets.push(buffer);
+                info!("Received Packet");
+                if self.recv_messages.1.try_enqueue(buffer).is_err() {
+                    warn!("E1000 receive queue full, dropping packet");
+                }
                 buffer = Vec::new();
             }
         }
@@ -258,6 +269,11 @@ impl E1000 {
         interrupt_dispatcher().assign(interrupt, Box::new(E1000InterruptHandler::new(device)));
         apic().allow(interrupt);
     }
+
+
+    pub fn mac_address(&self) -> EthernetAddress {
+        EthernetAddress::from_bytes(&self.mac)
+    }
 }
 
 impl E1000InterruptHandler {
@@ -268,15 +284,67 @@ impl E1000InterruptHandler {
 
 impl InterruptHandler for E1000InterruptHandler {
     fn trigger(&self) {
-        if let Some(mut device) = self.device.try_lock() {
             info!("E1000 interrupt handler triggered");
             let status = InterruptCause::from_bits_retain(self.device.registers.read_icr());
             if status.intersects(InterruptCause::RXDW | InterruptCause::RXO | InterruptCause::RXDMT0) {
                 self.device.receive_packets();
             }
-        }
     }
 }
+
+pub struct E1000TxToken<'a> {
+    device: &'a E1000,
+}
+
+pub struct E1000RxToken {
+    buffer: Vec<u8>,
+}
+
+impl<'a> phy::TxToken for E1000TxToken<'a> {
+    fn consume<R, F>(self, len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        let mut buffer = vec![0u8; len];
+        let result = f(&mut buffer);
+
+        self.device.send(buffer.as_ptr(), buffer.len());
+
+        result
+    }
+}
+
+impl phy::RxToken for E1000RxToken {
+    fn consume<R, F>(self, f: F) -> R
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        f(&self.buffer)
+    }
+}
+
+impl phy::Device for E1000 {
+    type RxToken<'a> = E1000RxToken where Self: 'a;
+    type TxToken<'a> = E1000TxToken<'a> where Self: 'a;
+
+    fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        let recv_buf = self.recv_messages.0.try_dequeue().ok()?;
+        Some((E1000RxToken { buffer: recv_buf }, E1000TxToken { device: self }))
+    }
+
+    fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
+        Some(E1000TxToken { device: self })
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        let mut caps = DeviceCapabilities::default();
+        caps.max_transmission_unit = 1536;
+        caps.max_burst_size = Some(1);
+        caps.medium = Medium::Ethernet;
+        caps
+    }
+}
+
 
 pub fn eeprom_read(mmio_base: u64, addr: u8) -> u16 {
     // START=1 + Adresse setzen
