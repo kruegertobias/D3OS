@@ -37,14 +37,14 @@ unsafe impl Send for E1000 {}
 
 
 pub struct TxRing {
-    pub vaddr: *mut TxDesc,
+    pub vaddr: u64,
     pub paddr: u64,
     pub count: usize,
     pub len_bytes: usize
 }
 
 pub struct RxRing {
-    pub vaddr: *mut RxDesc,
+    pub vaddr: u64,
     pub paddr: u64,
     pub count: usize,
     pub len_bytes: usize,
@@ -85,7 +85,7 @@ bitflags! {
 }
 
 pub struct E1000InterruptHandler {
-    device: Arc<Mutex<E1000>>,
+    device: Arc<E1000>,
 }
 
 impl E1000 {
@@ -163,7 +163,9 @@ impl E1000 {
         }
         //load tail descriptor
         let tail = self.registers.read_tdt() as usize;
-        let tx_desc = unsafe { &mut *self.tx_ring.vaddr.add(tail) };
+        let count = self.tx_ring.count;
+        let base = self.tx_ring.vaddr as *mut TxDesc;
+        let tx_desc = unsafe { &mut *base.add(tail % count) };
 
         let buffer_ptr = tx_desc.buffer_addr as *mut u8;
         unsafe {
@@ -192,18 +194,18 @@ impl E1000 {
             self.send_data(chunk_ptr, to_send as u32, to_send == (length - sent));
             sent += to_send;
         }
-
+        info!("Data send!");
         sent
     }
 
-    pub fn receive_packets(&mut self) -> Vec<Vec<u8>> {
+    pub fn receive_packets(&self) -> Vec<Vec<u8>> {
         let mut idx = self.rx_next; //aktuell zu verarbeitender deskriptor
         let mut packets = Vec::new(); // zum speichern der pakete, ersetze mit Netzwerkstack bald
         let mut buffer: Vec<u8> = Vec::new();  //
 
         loop {
-            let rx_desc = unsafe { &mut *self.rx_ring.vaddr.add(idx) };
-            if (rx_desc.status & (1 << 0)) == 0 { //ist der deskriptor gefühlt?
+            let base = self.rx_ring.vaddr as *mut RxDesc;
+            let rx_desc = unsafe { &mut *base.add(idx) };            if (rx_desc.status & (1 << 0)) == 0 { //ist der deskriptor gefühlt?
                 break;
             }
 
@@ -234,9 +236,8 @@ impl E1000 {
             idx - 1
         };
         self.registers.write_rdt(tail as u32);
-        self.rx_next = idx;
-        
-        info!("{:?}", packets);
+        let mut ptr = &self.rx_next as *const usize as *mut usize;
+        unsafe{ *ptr = idx; };
 
         packets
     }
@@ -252,15 +253,15 @@ impl E1000 {
         }
     }
 
-    pub fn plugin(device: Arc<Mutex<E1000>>) {
-        let interrupt = device.lock().interrupt;
+    pub fn plugin(device: Arc<E1000>) {
+        let interrupt = device.interrupt;
         interrupt_dispatcher().assign(interrupt, Box::new(E1000InterruptHandler::new(device)));
         apic().allow(interrupt);
     }
 }
 
 impl E1000InterruptHandler {
-    pub fn new(device: Arc<Mutex<E1000>>) -> Self {
+    pub fn new(device: Arc<E1000>) -> Self {
         Self { device }
     }
 }
@@ -269,9 +270,9 @@ impl InterruptHandler for E1000InterruptHandler {
     fn trigger(&self) {
         if let Some(mut device) = self.device.try_lock() {
             info!("E1000 interrupt handler triggered");
-            let status = InterruptCause::from_bits_retain(device.registers.read_icr());
+            let status = InterruptCause::from_bits_retain(self.device.registers.read_icr());
             if status.intersects(InterruptCause::RXDW | InterruptCause::RXO | InterruptCause::RXDMT0) {
-                device.receive_packets();
+                self.device.receive_packets();
             }
         }
     }
@@ -389,7 +390,7 @@ pub fn init_receive_ring() -> RxRing {
     }
 
     RxRing {
-        vaddr: base_addr,
+        vaddr: start, // Need to fix - funktioniert nur durch 1 zu 1 phys-virt
         paddr: start,
         count: NR_OF_DESCRIPTORS,
         len_bytes: NR_OF_DESCRIPTORS * RX_DESC_SIZE
@@ -467,7 +468,7 @@ pub fn init_transmit_ring() -> TxRing {
     }
 
     TxRing {
-        vaddr: base_addr,
+        vaddr: start, // Need to fix
         paddr: start,
         count: NR_OF_DESCRIPTORS,
         len_bytes: NR_OF_DESCRIPTORS * TX_DESC_SIZE
