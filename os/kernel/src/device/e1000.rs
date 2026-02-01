@@ -1,4 +1,5 @@
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -35,26 +36,19 @@ pub struct E1000 {
     mac: [u8; 6],
     mmio_virt_addr: u64,
     registers: E1000Register,
-    rx_ring: RxRing,
-    tx_ring: TxRing,
+    rx_ring: RingBuffer,
+    tx_ring: RingBuffer,
     rx_next: usize,
     interrupt: InterruptVector,
     recv_messages: (mpmc::bounded::scq::Receiver<Vec<u8>>, mpmc::bounded::scq::Sender<Vec<u8>>),
 }
 
 
-pub struct TxRing {
+pub struct RingBuffer {
     pub vaddr: u64,
     pub paddr: u64,
     pub count: usize,
     pub len_bytes: usize
-}
-
-pub struct RxRing {
-    pub vaddr: u64,
-    pub paddr: u64,
-    pub count: usize,
-    pub len_bytes: usize,
 }
 
 #[repr(C, packed)]
@@ -145,10 +139,10 @@ impl E1000 {
 
         init_ctrl(&mut e1000register);
 
-        let rx_ring = init_receive_ring();
+        let rx_ring = init_ringbuffer("rx_ring");
         init_receive_register(&mut e1000register, &rx_ring);
 
-        let tx_ring = init_transmit_ring();
+        let tx_ring = init_ringbuffer("tx_ring");
         init_transmit_register(&mut e1000register, &tx_ring);
 
         init_interrupt_registers(&e1000register);
@@ -418,7 +412,7 @@ pub fn init_ctrl(e1000register: &mut E1000Register) {
 
 }
 
-pub fn init_receive_ring() -> RxRing {
+pub fn init_ringbuffer(tag: &str) -> RingBuffer {
     // Alloc receive ringbuffer and set to 0
     let pages_ringbuffer = ((NR_OF_DESCRIPTORS * RX_DESC_SIZE) + PAGE_SIZE - 1) / PAGE_SIZE;
     let kernel_process = process_manager().read().kernel_process().expect("No kernel process found!");
@@ -442,7 +436,7 @@ pub fn init_receive_ring() -> RxRing {
         pages_buffer as u64,
         flags_buf,
         VmaType::KernelBuffer,
-        "rx_buffers",
+        tag,
     );
     let buf_base_paddr = buf_range.start.start_address().as_u64();
 
@@ -457,7 +451,7 @@ pub fn init_receive_ring() -> RxRing {
         }
     }
 
-    RxRing {
+    RingBuffer {
         vaddr: start, // Need to fix - funktioniert nur durch 1 zu 1 phys-virt
         paddr: start,
         count: NR_OF_DESCRIPTORS,
@@ -465,7 +459,7 @@ pub fn init_receive_ring() -> RxRing {
     }
 }
 
-pub fn init_receive_register(e1000register: &mut E1000Register, rx_ring: &RxRing) {
+pub fn init_receive_register(e1000register: &mut E1000Register, rx_ring: &RingBuffer) {
     let paddr = rx_ring.paddr;
 
     let rdbal = (paddr & 0xFFFF_FFFF) as u32;
@@ -495,55 +489,8 @@ pub fn init_receive_register(e1000register: &mut E1000Register, rx_ring: &RxRing
     // Flush
     e1000register.read_rctl();
 }
-pub fn init_transmit_ring() -> TxRing {
-    // alloc for transmit ringbuffer
-    let pages_ringbuffer = ((NR_OF_DESCRIPTORS * TX_DESC_SIZE) + PAGE_SIZE - 1) / PAGE_SIZE;
-    info!("Pages Ringbuffer = {}", pages_ringbuffer);
-    let kernel_process = process_manager().read().kernel_process().expect("No kernel process found!");
-    let vmm = &kernel_process.virtual_address_space;
-    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
-    let ring_tx_range = vmm.kernel_alloc_map_identity(pages_ringbuffer as u64, flags, VmaType::KernelBuffer, "tx_ringbuffer");
-    let start = ring_tx_range.start.start_address().as_u64();
-    let base_addr = start as *mut TxDesc;
-    unsafe {
-        core::ptr::write_bytes(
-            base_addr as *mut u8,
-            0,
-            NR_OF_DESCRIPTORS * TX_DESC_SIZE,
-        );
-    }
-    // alloc buffer for descriptors
-    let pages_buffers =  ((NR_OF_DESCRIPTORS * DESCRIPTOR_BUFFER_SIZE) + PAGE_SIZE - 1) / PAGE_SIZE;
-    info!("Pages TX Buffers = {}", pages_buffers);
-    let flags_buf = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
-    let buf_range = vmm.kernel_alloc_map_identity(
-        pages_buffers as u64,
-        flags_buf,
-        VmaType::KernelBuffer,
-        "tx_buffers",
-    );
-    let buf_base_paddr = buf_range.start.start_address().as_u64();
 
-    // add pointer to every descriptor
-    for i in 0..NR_OF_DESCRIPTORS {
-        let buf_paddr = buf_base_paddr + (i as u64) * (DESCRIPTOR_BUFFER_SIZE as u64);
-
-        unsafe {
-            let d = base_addr.add(i);
-
-            (*d).buffer_addr = buf_paddr;
-        }
-    }
-
-    TxRing {
-        vaddr: start, // Need to fix
-        paddr: start,
-        count: NR_OF_DESCRIPTORS,
-        len_bytes: NR_OF_DESCRIPTORS * TX_DESC_SIZE
-    }
-}
-
-pub fn init_transmit_register(e1000register: &mut E1000Register, tx: &TxRing) {
+pub fn init_transmit_register(e1000register: &mut E1000Register, tx: &RingBuffer) {
     // 1) Descriptor Ring Base/Len
     let paddr = tx.paddr;
     let tdbal = (paddr & 0xFFFF_FFFF) as u32;
