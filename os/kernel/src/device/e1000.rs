@@ -386,7 +386,7 @@ pub fn init_interrupt_registers(e1000register: &E1000Register) {
     e1000register.write_imc(u32::MAX);
     e1000register.read_icr();
 
-    let mask = (InterruptCause::RXDW | InterruptCause::RXO | InterruptCause::RXDMT0).bits();
+    let mask = (InterruptCause::LSC | InterruptCause::RXO | InterruptCause::RXDMT0 | InterruptCause::RXT0 | InterruptCause::RXSEQ).bits();
     e1000register.write_ims(mask);
 }
 
