@@ -76,12 +76,11 @@ const TX_DESC_SIZE: usize = core::mem::size_of::<TxDesc>();
 
 bitflags! {
     pub struct InterruptCause: u32 {
-        const TXDW = 0x00000001;
-        const TXQE = 0x00000002;
         const LSC = 0x00000004;
         const RXDMT0 = 0x00000010;
         const RXO = 0x00000040;
-        const RXDW = 0x00000080;
+        const RXT0 = 0x00000080;
+        const RXSEQ = 0x00000008;
     }
 }
 
@@ -207,7 +206,8 @@ impl E1000 {
 
         loop {
             let base = self.rx_ring.vaddr as *mut RxDesc;
-            let rx_desc = unsafe { &mut *base.add(idx) };            if (rx_desc.status & (1 << 0)) == 0 { //ist der deskriptor gefühlt?
+            let rx_desc = unsafe { &mut *base.add(idx) };
+            if (rx_desc.status & (1 << 0)) == 0 { //ist der deskriptor gefühlt?
                 break;
             }
 
@@ -280,7 +280,7 @@ impl InterruptHandler for E1000InterruptHandler {
     fn trigger(&self) {
             info!("E1000 interrupt handler triggered");
             let status = InterruptCause::from_bits_retain(self.device.registers.read_icr());
-            if status.intersects(InterruptCause::RXDW | InterruptCause::RXO | InterruptCause::RXDMT0) {
+            if status.intersects(InterruptCause::RXSEQ | InterruptCause::RXO | InterruptCause::RXDMT0 | InterruptCause::LSC | InterruptCause::RXT0) {
                 self.device.receive_packets();
             }
     }
@@ -321,11 +321,14 @@ impl phy::Device for E1000 {
     type RxToken<'a> = E1000RxToken where Self: 'a;
     type TxToken<'a> = E1000TxToken<'a> where Self: 'a;
 
+    // Methode soll ein receive und ein transmit Token erstellen
+    // (Transmit Token macht es möglich eine Antowrt zu generieren je nach empfangenen Paket)
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let recv_buf = self.recv_messages.0.try_dequeue().ok()?;
         Some((E1000RxToken { buffer: recv_buf }, E1000TxToken { device: self }))
     }
 
+    //Methode soll ein Transmit Roken erstellen
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         Some(E1000TxToken { device: self })
     }
@@ -376,9 +379,13 @@ pub fn is_valid_mac(mac: &[u8; 6]) -> bool {
         mac != &[0xFF; 6] &&
         (mac[0] & 1) == 0
 }
+
+// RXT, RXO, RXDMT,
+// RXSEQ, and LSC
 pub fn init_interrupt_registers(e1000register: &E1000Register) {
     e1000register.write_imc(u32::MAX);
     e1000register.read_icr();
+
     let mask = (InterruptCause::RXDW | InterruptCause::RXO | InterruptCause::RXDMT0).bits();
     e1000register.write_ims(mask);
 }
