@@ -371,17 +371,16 @@ pub fn read_mac_address(mmio_base: u64) -> [u8; 6] {
     ]
 }
 
+pub fn is_valid_mac(mac: &[u8; 6]) -> bool {
+    mac != &[0, 0, 0, 0, 0, 0] &&
+        mac != &[0xFF; 6] &&
+        (mac[0] & 1) == 0
+}
 pub fn init_interrupt_registers(e1000register: &E1000Register) {
     e1000register.write_imc(u32::MAX);
     e1000register.read_icr();
     let mask = (InterruptCause::RXDW | InterruptCause::RXO | InterruptCause::RXDMT0).bits();
     e1000register.write_ims(mask);
-}
-
-pub fn is_valid_mac(mac: &[u8; 6]) -> bool {
-    mac != &[0, 0, 0, 0, 0, 0] &&
-        mac != &[0xFF; 6] &&
-        (mac[0] & 1) == 0
 }
 
 pub fn init_ctrl(e1000register: &mut E1000Register) {
@@ -396,7 +395,7 @@ pub fn init_ctrl(e1000register: &mut E1000Register) {
     ctrl = ctrl & !(1 << 7);
     //enable Receive Flow Control and Transmit Flow Control via Phy-Auto-Negotiation.
     ctrl |= (1 << 27) | (1 << 28);
-    // clear CTRL.FRCSDP
+    // clear CTRL.FRCSPD
     ctrl = ctrl & !(1 << 11);
     // clear FRCDPLX
     ctrl = ctrl & !(1 << 12);
@@ -413,12 +412,12 @@ pub fn init_ctrl(e1000register: &mut E1000Register) {
 }
 
 pub fn init_ringbuffer(tag: &str) -> RingBuffer {
-    // Alloc receive ringbuffer and set to 0
+    // Alloc ringbuffer and set to 0
     let pages_ringbuffer = ((NR_OF_DESCRIPTORS * RX_DESC_SIZE) + PAGE_SIZE - 1) / PAGE_SIZE;
     let kernel_process = process_manager().read().kernel_process().expect("No kernel process found!");
     let vmm = &kernel_process.virtual_address_space;
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
-    let ring_rx_range = vmm.kernel_alloc_map_identity(pages_ringbuffer as u64, flags, VmaType::KernelBuffer, "rx_ringbuffer");
+    let ring_rx_range = vmm.kernel_alloc_map_identity(pages_ringbuffer as u64, flags, VmaType::KernelBuffer, tag);
     let start = ring_rx_range.start.start_address().as_u64();
     let base_addr = start as *mut RxDesc;
     unsafe {
@@ -478,13 +477,19 @@ pub fn init_receive_register(e1000register: &mut E1000Register, rx_ring: &RingBu
     e1000register.write_rdh(0);
     e1000register.write_rdt((rx_ring.count - 1) as u32);
 
+    let mut rctl = e1000register.read_rctl();
+
     // 3) Receive Control Register
-    let rctl =
-        (1 << 1) |          // Receiver enable
-            (1 << 5) |         // Long Packet Enable
-                (1 << 15) |         // Broadcast Accept Mode
-                    (1 << 6) |   // Loop Back Mode
-                        (0b00 << 16);  // 2048 Byte Buffers (BSEX = 0)
+    // enable Recevier RCTL.EN
+    rctl = rctl | (1 << 1);
+    // CTRL.LBM is 00b for normal operation
+    rctl = rctl & !(1 << 6) & !(1<<7);
+    // configure packet buffer size
+    rctl = rctl |  (0b00 << 16);
+    // allow hardware to accept broadcast packets (RCTL.BAM)
+    rctl = rctl | (1 << 15);
+
+
     e1000register.write_rctl(rctl);
     // Flush
     e1000register.read_rctl();
@@ -512,9 +517,8 @@ pub fn init_transmit_register(e1000register: &mut E1000Register, tx: &RingBuffer
     info!("E1000 TCTL: {:#010x}", tctl );
 
     // 4) TCTL: EN=1, PSP=1
-    let tctl_val =
-        (1u32 << 1) |          // EN
-            (1u32 << 3);          // PSP
+    let tctl_val =  (1u32 << 1) | (1u32 << 3);
+
     e1000register.write_tctl(tctl_val);
     info!("E1000 TCTL: {:#010x}", tctl_val );
 
