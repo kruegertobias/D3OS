@@ -7,7 +7,7 @@ use log::{info, warn};
 use spin::{Mutex, RwLock};
 use core::ops::BitOr;
 use core::slice;
-use bitflags::bitflags;
+use bitflags::{bitflags, Flags};
 use nolock::queues::mpmc;
 use x86_64::{structures::paging::{page::PageRange, Page, PageTableFlags}, VirtAddr};
 use pci_types::{CommandRegister, EndpointHeader};
@@ -28,66 +28,21 @@ use crate::memory::vmm::VirtualAddressSpace;
 use crate::process::process;
 use crate::syscall::sys_concurrent::sys_thread_sleep;
 
+const DESCRIPTOR_SIZE1: usize = core::mem::size_of::<RxDesc>(); // TxDesc und RxDesc haben die gleiche Größe somit egal
 const DESCRIPTOR_BUFFER_SIZE: usize = 2048;
 const NR_OF_DESCRIPTORS: usize = 256;
 const RECV_QUEUE_CAP: usize = 64;
 
 pub struct E1000 {
-    mac: [u8; 6],
-    mmio_virt_addr: u64,
+    mac: [u8; 6], // MAC-Adresse der Karte
+    mmio_virt_addr: u64, // virtuelle Adresse des Beginn der Karte im Speicher
     registers: E1000Register,
     rx_ring: RingBuffer,
     tx_ring: RingBuffer,
-    rx_next: usize,
+    rx_next: usize, // count für den nächsten zu verarbeitenden Deskriptor im RxRing
     interrupt: InterruptVector,
     recv_messages: (mpmc::bounded::scq::Receiver<Vec<u8>>, mpmc::bounded::scq::Sender<Vec<u8>>),
 }
-
-
-pub struct RingBuffer {
-    pub vaddr: u64,
-    pub paddr: u64,
-    pub count: usize,
-    pub len_bytes: usize
-}
-
-#[repr(C, packed)]
-pub struct TxDesc {
-    pub buffer_addr: u64, // Physische Adresse des Sendepuffers
-    pub length:      u16, // Länge des Pakets
-    pub cso:         u8,
-    pub cmd:         u8,  // EOP, IFCS, RS, ...
-    pub status:      u8,  // Wird von HW gesetzt
-    pub css:         u8,
-    pub special:     u16,
-}
-
-#[repr(C, packed)]
-pub struct RxDesc {
-    pub buffer_addr: u64,
-    pub length: u16,
-    pub checksum: u16,
-    pub status: u8,
-    pub errors: u8,
-    pub special: u16,
-}
-const RX_DESC_SIZE: usize = core::mem::size_of::<RxDesc>();
-const TX_DESC_SIZE: usize = core::mem::size_of::<TxDesc>();
-
-bitflags! {
-    pub struct InterruptCause: u32 {
-        const LSC = 0x00000004;
-        const RXDMT0 = 0x00000010;
-        const RXO = 0x00000040;
-        const RXT0 = 0x00000080;
-        const RXSEQ = 0x00000008;
-    }
-}
-
-pub struct E1000InterruptHandler {
-    device: Arc<E1000>,
-}
-
 impl E1000 {
     pub fn new(pci_device: &RwLock<EndpointHeader>) -> Self {
         info!("Configuring PCI registers");
@@ -117,18 +72,9 @@ impl E1000 {
         let mut e1000register = E1000Register::new(mmio_virt_addr);
 
         let ctrl = e1000register.read_ctrl();
-        log::info!("E1000 CTRL: {:#010x}", ctrl);
-
-        let status = unsafe { e1000register.read_status() };
-        log::info!("E1000 STATUS: {:#010x}", status);
-
         //set reset bit CTRL.RST(26)
         e1000register.write_ctrl(ctrl | (1 << 26));
-        //Flush
-        e1000register.read_ctrl();
-        while e1000register.read_ctrl() & (1 << 26) != 0 {}
-
-        udelay(5000);
+        sys_thread_sleep(1); // ensure that global device reset has fully completed
 
         // read MAC Address from EEPROM
         let mac = read_mac_address(mmio_virt_addr);
@@ -270,6 +216,50 @@ impl E1000 {
     }
 }
 
+
+
+pub struct RingBuffer {
+    pub vaddr: u64, // virtuelle Adresse
+    pub paddr: u64, // physikalische Adresse
+    pub count: usize, // Anzahl der Deskriptoren
+    pub len_bytes: usize // Größe insgesamt in Byte
+}
+
+#[repr(C, packed)]
+pub struct TxDesc {
+    pub buffer_addr: u64, // Physische Adresse des Sendepuffers
+    pub length:      u16, // Länge des Pakets
+    pub cso:         u8,  // Checksum Offset
+    pub cmd:         u8,  // Command Field(EOP, IFCS, RS, ...)
+    pub status:      u8,  // Status Field(ersten 4 Bits)/Reserved(letzten 4 Bits)
+    pub css:         u8,  // Checksum Start Field
+    pub special:     u16, // Special Field
+}
+
+#[repr(C, packed)]
+pub struct RxDesc {
+    pub buffer_addr: u64, // Physische Adresse des Empfangpuffer
+    pub length: u16, // Länge des Paket
+    pub checksum: u16,
+    pub status: u8,
+    pub errors: u8,
+    pub special: u16,
+}
+
+bitflags! {
+    pub struct InterruptCause: u32 {
+        const LSC = 0x00000004;
+        const RXDMT0 = 0x00000010;
+        const RXO = 0x00000040;
+        const RXT0 = 0x00000080;
+        const RXSEQ = 0x00000008;
+    }
+}
+
+pub struct E1000InterruptHandler {
+    device: Arc<E1000>,
+}
+
 impl E1000InterruptHandler {
     pub fn new(device: Arc<E1000>) -> Self {
         Self { device }
@@ -280,7 +270,20 @@ impl InterruptHandler for E1000InterruptHandler {
     fn trigger(&self) {
             info!("E1000 interrupt handler triggered");
             let status = InterruptCause::from_bits_retain(self.device.registers.read_icr());
-            if status.intersects(InterruptCause::RXSEQ | InterruptCause::RXO | InterruptCause::RXDMT0 | InterruptCause::LSC | InterruptCause::RXT0) {
+            if status.intersects(InterruptCause::RXSEQ) {
+                info!("RXSEQ Interrupt");
+                self.device.receive_packets();
+            } else if status.intersects(InterruptCause::RXO) {
+                info!("RXO Interrupt");
+                self.device.receive_packets();
+            } else if status.intersects(InterruptCause::RXT0) {
+                info!("RXT0 Interrupt");
+                self.device.receive_packets();
+            } else if status.intersects(InterruptCause::LSC) {
+                info!("LSC Interrupt");
+                self.device.receive_packets();
+            } else if status.intersects(InterruptCause::RXDMT0) {
+                info!("RXDMT0 Interrupt");
                 self.device.receive_packets();
             }
     }
@@ -328,7 +331,7 @@ impl phy::Device for E1000 {
         Some((E1000RxToken { buffer: recv_buf }, E1000TxToken { device: self }))
     }
 
-    //Methode soll ein Transmit Roken erstellen
+    //Methode soll ein Transmit Token erstellen
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         Some(E1000TxToken { device: self })
     }
@@ -420,18 +423,23 @@ pub fn init_ctrl(e1000register: &mut E1000Register) {
 
 pub fn init_ringbuffer(tag: &str) -> RingBuffer {
     // Alloc ringbuffer and set to 0
-    let pages_ringbuffer = ((NR_OF_DESCRIPTORS * RX_DESC_SIZE) + PAGE_SIZE - 1) / PAGE_SIZE;
+    let pages_ringbuffer = ((NR_OF_DESCRIPTORS * DESCRIPTOR_SIZE1) + PAGE_SIZE - 1) / PAGE_SIZE;
     let kernel_process = process_manager().read().kernel_process().expect("No kernel process found!");
     let vmm = &kernel_process.virtual_address_space;
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
     let ring_rx_range = vmm.kernel_alloc_map_identity(pages_ringbuffer as u64, flags, VmaType::KernelBuffer, tag);
     let start = ring_rx_range.start.start_address().as_u64();
+
+    /* da in dieser Methode nur Felder genutzt werden die bei RxDesc und TxDesc gleich sind(base_address)
+       stellt der ausdruck kein Problem dar, wenn in Zukunft typische RxDesc oder TxDesc Felder genutzt werden
+       muss hier eine Anpassung stattfinden */
+
     let base_addr = start as *mut RxDesc;
     unsafe {
         core::ptr::write_bytes(
             base_addr as *mut u8,
             0,
-            NR_OF_DESCRIPTORS * RX_DESC_SIZE,
+            NR_OF_DESCRIPTORS * DESCRIPTOR_SIZE1,
         );
     }
 
@@ -461,13 +469,12 @@ pub fn init_ringbuffer(tag: &str) -> RingBuffer {
         vaddr: start, // Need to fix - funktioniert nur durch 1 zu 1 phys-virt
         paddr: start,
         count: NR_OF_DESCRIPTORS,
-        len_bytes: NR_OF_DESCRIPTORS * RX_DESC_SIZE
+        len_bytes: NR_OF_DESCRIPTORS * DESCRIPTOR_SIZE1
     }
 }
 
 pub fn init_receive_register(e1000register: &mut E1000Register, rx_ring: &RingBuffer) {
     let paddr = rx_ring.paddr;
-
     let rdbal = (paddr & 0xFFFF_FFFF) as u32;
     let rdbah = (paddr >> 32) as u32;
 
@@ -498,8 +505,6 @@ pub fn init_receive_register(e1000register: &mut E1000Register, rx_ring: &RingBu
 
 
     e1000register.write_rctl(rctl);
-    // Flush
-    e1000register.read_rctl();
 }
 
 pub fn init_transmit_register(e1000register: &mut E1000Register, tx: &RingBuffer) {
@@ -510,7 +515,7 @@ pub fn init_transmit_register(e1000register: &mut E1000Register, tx: &RingBuffer
 
     // TDLEN muss 128-Byte aligned sein (untere 7 Bits = 0)
     let tdlen = tx.len_bytes as u32;
-    assert!((tdlen & 0x7F) == 0, "TDLEN must be 128-byte aligned");
+    assert_eq!((tdlen & 0x7F), 0, "TDLEN must be 128-byte aligned");
 
     e1000register.write_tdbal(tdbal);
     e1000register.write_tdbah(tdbah);
@@ -520,14 +525,11 @@ pub fn init_transmit_register(e1000register: &mut E1000Register, tx: &RingBuffer
     e1000register.write_tdh(0);
     e1000register.write_tdt(0);
 
-    let tctl = e1000register.read_tctl();
-    info!("E1000 TCTL: {:#010x}", tctl );
 
     // 4) TCTL: EN=1, PSP=1
     let tctl_val =  (1u32 << 1) | (1u32 << 3);
 
     e1000register.write_tctl(tctl_val);
-    info!("E1000 TCTL: {:#010x}", tctl_val );
 
     //Flush
     e1000register.read_tctl();
