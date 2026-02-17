@@ -22,6 +22,9 @@ pub struct E1000Register {
     icr: u64,
     ims: u64,
     imc: u64,
+    ral: u64,
+    rah: u64,
+    mta: u64,
 }
 
 
@@ -51,6 +54,9 @@ impl E1000Register {
             icr: mmio_virt_addr + 0x000C0,
             ims: mmio_virt_addr + 0x000D0,
             imc: mmio_virt_addr + 0x000D8,
+            ral: mmio_virt_addr + 0x05400,
+            rah: mmio_virt_addr + 0x05404,
+            mta: mmio_virt_addr + 0x05200,
         }
     }
 
@@ -253,5 +259,29 @@ impl E1000Register {
         unsafe { core::ptr::write_volatile(self.imc as *mut u32, val) }
     }
 
+    //RAH
+    pub fn read_rah(&self) -> u32 {
+        unsafe { core::ptr::read_volatile(self.rah as *const u32) }
+    }
+
+    pub fn write_rah(&self, val: u32) {
+        unsafe { core::ptr::write_volatile(self.rah as *mut u32, val) }
+    }
+
+    //RAL
+    pub fn read_ral(&self) -> u32 {
+        unsafe { core::ptr::read_volatile(self.ral as *const u32) }
+    }
+
+    pub fn write_ral(&self, val: u32) {
+        unsafe { core::ptr::write_volatile(self.ral as *mut u32, val) }
+    }
+
+    pub fn clear_mta(&self) {
+        for i in 0..128 {
+            let reg = (self.mta + i * 4) as *mut u32;
+            unsafe { core::ptr::write_volatile(reg, 0); }
+        }
+    }
 
 }

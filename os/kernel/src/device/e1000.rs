@@ -28,7 +28,7 @@ use crate::memory::vmm::VirtualAddressSpace;
 use crate::process::process;
 use crate::syscall::sys_concurrent::sys_thread_sleep;
 
-const DESCRIPTOR_SIZE1: usize = core::mem::size_of::<RxDesc>(); // TxDesc und RxDesc haben die gleiche Größe somit egal
+const DESCRIPTOR_SIZE: usize = core::mem::size_of::<RxDesc>(); // TxDesc und RxDesc haben die gleiche Größe somit egal
 const DESCRIPTOR_BUFFER_SIZE: usize = 2048;
 const NR_OF_DESCRIPTORS: usize = 256;
 const RECV_QUEUE_CAP: usize = 64;
@@ -82,15 +82,17 @@ impl E1000 {
         log::info!("MAC = {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
+
+        init_interrupt_registers(&e1000register);
+
         init_ctrl(&mut e1000register);
 
         let rx_ring = init_ringbuffer("rx_ring");
-        init_receive_register(&mut e1000register, &rx_ring);
+        init_receive_register(&mut e1000register, &rx_ring, &mac);
 
         let tx_ring = init_ringbuffer("tx_ring");
         init_transmit_register(&mut e1000register, &tx_ring);
 
-        init_interrupt_registers(&e1000register);
 
         Self {
             mac,
@@ -105,9 +107,6 @@ impl E1000 {
     }
 
     fn send_data(&self, data: *const u8, size: u32, eop: bool) {
-        if size as usize > DESCRIPTOR_BUFFER_SIZE {
-            panic!("E1000 send_data size exceeds descriptor buffer");
-        }
         //load tail descriptor
         let tail = self.registers.read_tdt() as usize;
         let count = self.tx_ring.count;
@@ -132,9 +131,8 @@ impl E1000 {
         self.registers.write_tdt(next_tail as u32);
     }
 
-    pub fn send(&self, data: *const u8, length: usize) -> usize {
+    pub fn send(&self, data: *const u8, length: usize) {
         let mut sent = 0usize;
-
         while sent < length {
             let to_send = core::cmp::min(length - sent, DESCRIPTOR_BUFFER_SIZE);
             let chunk_ptr = unsafe { data.add(sent) };
@@ -142,18 +140,16 @@ impl E1000 {
             sent += to_send;
         }
         info!("Data send!");
-        sent
     }
 
-    pub fn receive_packets(&self) -> Vec<Vec<u8>> {
+    pub fn receive_packets(&self) {
         let mut idx = self.rx_next; //aktuell zu verarbeitender deskriptor
-        let mut packets = Vec::new(); // zum speichern der pakete, ersetze mit Netzwerkstack bald
-        let mut buffer: Vec<u8> = Vec::new();  //
+        let mut buffer: Vec<u8> = Vec::new();
 
         loop {
             let base = self.rx_ring.vaddr as *mut RxDesc;
             let rx_desc = unsafe { &mut *base.add(idx) };
-            if (rx_desc.status & (1 << 0)) == 0 { //ist der deskriptor gefühlt?
+            if (rx_desc.status & (1 << 0)) == 0 { //ist der deskriptor gefüllt?
                 break;
             }
 
@@ -172,7 +168,7 @@ impl E1000 {
 
             if eop {
                 //Letzter Deskriptor des Paketes, push das paket zum netzwerkstack
-                info!("Received Packet");
+                //info!("Received Packet");
                 if self.recv_messages.1.try_enqueue(buffer).is_err() {
                     warn!("E1000 receive queue full, dropping packet");
                 }
@@ -189,8 +185,6 @@ impl E1000 {
         self.registers.write_rdt(tail as u32);
         let mut ptr = &self.rx_next as *const usize as *mut usize;
         unsafe{ *ptr = idx; };
-
-        packets
     }
 
 
@@ -199,8 +193,7 @@ impl E1000 {
     pub fn test_send(&self) {
         for _ in 0..2 {
             let payload = [0xFFu8; 2048];
-            let sent = self.send(payload.as_ptr(), payload.len());
-            info!("E1000 test_send: queued {} bytes", sent);
+            self.send(payload.as_ptr(), payload.len());
         }
     }
 
@@ -277,11 +270,10 @@ impl InterruptHandler for E1000InterruptHandler {
                 info!("RXO Interrupt");
                 self.device.receive_packets();
             } else if status.intersects(InterruptCause::RXT0) {
-                info!("RXT0 Interrupt");
+               // info!("RXT0 Interrupt");
                 self.device.receive_packets();
             } else if status.intersects(InterruptCause::LSC) {
-                info!("LSC Interrupt");
-                self.device.receive_packets();
+                info!("LSC Interrupt: Link Status Change");
             } else if status.intersects(InterruptCause::RXDMT0) {
                 info!("RXDMT0 Interrupt");
                 self.device.receive_packets();
@@ -403,8 +395,6 @@ pub fn init_ctrl(e1000register: &mut E1000Register) {
     ctrl = ctrl & !(1 << 31);
     //clear CTRL.ILOS
     ctrl = ctrl & !(1 << 7);
-    //enable Receive Flow Control and Transmit Flow Control via Phy-Auto-Negotiation.
-    ctrl |= (1 << 27) | (1 << 28);
     // clear CTRL.FRCSPD
     ctrl = ctrl & !(1 << 11);
     // clear FRCDPLX
@@ -423,7 +413,7 @@ pub fn init_ctrl(e1000register: &mut E1000Register) {
 
 pub fn init_ringbuffer(tag: &str) -> RingBuffer {
     // Alloc ringbuffer and set to 0
-    let pages_ringbuffer = ((NR_OF_DESCRIPTORS * DESCRIPTOR_SIZE1) + PAGE_SIZE - 1) / PAGE_SIZE;
+    let pages_ringbuffer = ((NR_OF_DESCRIPTORS * DESCRIPTOR_SIZE) + PAGE_SIZE - 1) / PAGE_SIZE;
     let kernel_process = process_manager().read().kernel_process().expect("No kernel process found!");
     let vmm = &kernel_process.virtual_address_space;
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
@@ -439,7 +429,7 @@ pub fn init_ringbuffer(tag: &str) -> RingBuffer {
         core::ptr::write_bytes(
             base_addr as *mut u8,
             0,
-            NR_OF_DESCRIPTORS * DESCRIPTOR_SIZE1,
+            NR_OF_DESCRIPTORS * DESCRIPTOR_SIZE,
         );
     }
 
@@ -457,10 +447,8 @@ pub fn init_ringbuffer(tag: &str) -> RingBuffer {
     //write every address in descriptor.buffer_addr
     for i in 0..NR_OF_DESCRIPTORS {
         let buf_paddr = buf_base_paddr + (i as u64) * (DESCRIPTOR_BUFFER_SIZE as u64);
-
         unsafe {
             let d = base_addr.add(i);
-
             (*d).buffer_addr = buf_paddr;
         }
     }
@@ -469,11 +457,24 @@ pub fn init_ringbuffer(tag: &str) -> RingBuffer {
         vaddr: start, // Need to fix - funktioniert nur durch 1 zu 1 phys-virt
         paddr: start,
         count: NR_OF_DESCRIPTORS,
-        len_bytes: NR_OF_DESCRIPTORS * DESCRIPTOR_SIZE1
+        len_bytes: NR_OF_DESCRIPTORS * DESCRIPTOR_SIZE
     }
 }
 
-pub fn init_receive_register(e1000register: &mut E1000Register, rx_ring: &RingBuffer) {
+pub fn init_receive_register(e1000register: &mut E1000Register, rx_ring: &RingBuffer, mac: &[u8; 6]) {
+    //Write MAC to RAL/RAH
+    let ral = u32::from_le_bytes([mac[0], mac[1], mac[2], mac[3]]);
+    let w3  = u16::from_le_bytes([mac[4], mac[5]]) as u32;
+
+    let mut rah = e1000register.read_rah();
+    rah = (rah & 0xFFFF_0000) | w3;
+
+    e1000register.write_rah(rah);
+    e1000register.write_ral(ral);
+
+    // cleare alle MTA(Multicast Table Array) Eintraege
+    e1000register.clear_mta();
+
     let paddr = rx_ring.paddr;
     let rdbal = (paddr & 0xFFFF_FFFF) as u32;
     let rdbah = (paddr >> 32) as u32;
@@ -496,13 +497,12 @@ pub fn init_receive_register(e1000register: &mut E1000Register, rx_ring: &RingBu
     // 3) Receive Control Register
     // enable Recevier RCTL.EN
     rctl = rctl | (1 << 1);
-    // CTRL.LBM is 00b for normal operation
+    // RCTL.LBM is 00b for normal operation
     rctl = rctl & !(1 << 6) & !(1<<7);
-    // configure packet buffer size
+    // configure RCTL.BSIZE 00b=2048 Bytes
     rctl = rctl |  (0b00 << 16);
     // allow hardware to accept broadcast packets (RCTL.BAM)
     rctl = rctl | (1 << 15);
-
 
     e1000register.write_rctl(rctl);
 }
@@ -525,14 +525,10 @@ pub fn init_transmit_register(e1000register: &mut E1000Register, tx: &RingBuffer
     e1000register.write_tdh(0);
     e1000register.write_tdt(0);
 
-
     // 4) TCTL: EN=1, PSP=1
     let tctl_val =  (1u32 << 1) | (1u32 << 3);
 
     e1000register.write_tctl(tctl_val);
-
-    //Flush
-    e1000register.read_tctl();
 }
 
 unsafe fn mmio_read32(base: u64, offset: u32) -> u32 {

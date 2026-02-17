@@ -48,7 +48,6 @@ pub fn init() {
             info!("Found Realtek RTL8139 network controller");
             let rtl8139 = Arc::new(Rtl8139::new(rtldevices[0]));
             info!("RTL8139 MAC address: [{}]", rtl8139.read_mac_address());
-
             Rtl8139::plugin(Arc::clone(&rtl8139));
             rtl8139
         });
@@ -61,7 +60,6 @@ pub fn init() {
             info!("Found Intel E1000 network controller");
             let e1000 = Arc::new(E1000::new(e1000_devices[0]));
             E1000::plugin(Arc::clone(&e1000));
-            e1000.test_send();
             e1000
         });
     }
@@ -70,8 +68,7 @@ pub fn init() {
         extern "sysv64" fn poll() {
             loop { e1000_poll_sockets(); scheduler().sleep(50); }
         }
-        scheduler().ready(Thread::new_kernel_thread(poll, "RTL8139"));
-
+        scheduler().ready(Thread::new_kernel_thread(poll, "E1000"));
         // Set up network interface
         let time = timer().systime_ms();
         let mut conf = iface::Config::new(HardwareAddress::from(e1000.mac_address()));
@@ -111,12 +108,14 @@ pub fn init() {
         });
     }
 
+
+/*
     if let Some(rtl8139) = RTL8139.get() {
         extern "sysv64" fn poll() {
             loop { poll_sockets(); scheduler().sleep(50); }
         }
         scheduler().ready(Thread::new_kernel_thread(poll, "RTL8139"));
-        
+
         // Set up network interface
         let time = timer().systime_ms();
         let mut conf = iface::Config::new(HardwareAddress::from(rtl8139.read_mac_address()));
@@ -155,6 +154,8 @@ pub fn init() {
             dhcp_handle
         });
     }
+
+*/
 }
 
 fn check_ownership(handle: SocketHandle) {
@@ -182,7 +183,7 @@ fn add_interface(interface: Interface) {
 }
 
 /// Get IP addresses for a host.
-/// 
+///
 /// If host is none, get the addresses of the current host.
 pub fn get_ip_addresses(host: Option<&str>) -> Vec<IpAddress> {
     if let Some(host) = host {
@@ -287,7 +288,7 @@ pub fn open_tcp() -> SocketHandle {
 
 pub fn open_icmp() -> SocketHandle {
     let sockets = SOCKETS.get().expect("Socket set not initialized!");
-    
+
     let rx_buffer = icmp::PacketBuffer::new(
         vec![icmp::PacketMetadata::EMPTY, icmp::PacketMetadata::EMPTY],
         vec![0; 65535],
@@ -397,8 +398,42 @@ pub fn receive_icmp(handle: SocketHandle, data: &mut [u8]) -> Result<(usize, IpA
     socket.recv_slice(data)
 }
 
+pub fn can_recv(handle: SocketHandle, protocol: SocketType) -> bool {
+    match protocol {
+        SocketType::Udp => {
+            get_socket_for_current_process!(socket, handle, udp::Socket);
+            socket.can_recv()
+        },
+        SocketType::Tcp => {
+            get_socket_for_current_process!(socket, handle, tcp::Socket);
+            socket.can_recv()
+        }
+        SocketType::Icmp => {
+            get_socket_for_current_process!(socket, handle, icmp::Socket);
+            socket.can_recv()
+        }
+    }
+}
+
+pub fn can_send(handle: SocketHandle, protocol: SocketType) -> bool {
+    match protocol {
+        SocketType::Udp => {
+            get_socket_for_current_process!(socket, handle, udp::Socket);
+            socket.can_send()
+        },
+        SocketType::Tcp => {
+            get_socket_for_current_process!(socket, handle, tcp::Socket);
+            socket.can_send()
+        }
+        SocketType::Icmp => {
+            get_socket_for_current_process!(socket, handle, icmp::Socket);
+            socket.can_send()
+        }
+    }
+}
+
 /// Try to poll all sockets.
-/// 
+///
 /// This returns None, if it failed to get all needed locks.
 /// This is needed, because we otherwise might get a deadlock, because an
 /// application has the lock on `sockets` while we have the lock on `interfaces`.
