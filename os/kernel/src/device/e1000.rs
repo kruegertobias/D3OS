@@ -168,7 +168,7 @@ impl E1000 {
 
             if eop {
                 //Letzter Deskriptor des Paketes, push das paket zum netzwerkstack
-                //info!("Received Packet");
+                info!("Received Packet");
                 if self.recv_messages.1.try_enqueue(buffer).is_err() {
                     warn!("E1000 receive queue full, dropping packet");
                 }
@@ -261,21 +261,15 @@ impl E1000InterruptHandler {
 
 impl InterruptHandler for E1000InterruptHandler {
     fn trigger(&self) {
-            info!("E1000 interrupt handler triggered");
             let status = InterruptCause::from_bits_retain(self.device.registers.read_icr());
             if status.intersects(InterruptCause::RXSEQ) {
-                info!("RXSEQ Interrupt");
                 self.device.receive_packets();
             } else if status.intersects(InterruptCause::RXO) {
-                info!("RXO Interrupt");
                 self.device.receive_packets();
             } else if status.intersects(InterruptCause::RXT0) {
-               // info!("RXT0 Interrupt");
                 self.device.receive_packets();
             } else if status.intersects(InterruptCause::LSC) {
-                info!("LSC Interrupt: Link Status Change");
             } else if status.intersects(InterruptCause::RXDMT0) {
-                info!("RXDMT0 Interrupt");
                 self.device.receive_packets();
             }
     }
