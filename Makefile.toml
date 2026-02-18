@@ -44,12 +44,56 @@ args = [
     "-object", "memory-backend-file,id=mem1,share=on,mem-path=nvdimm0,size=16M",
 
     # Network configuration e1000
-    "-device", "e1000,netdev=net0,id=e1000",
-    "-netdev", "user,id=net0,hostfwd=tcp::2222-:22",
+    "-nic", "model=e1000,id=e1000,hostfwd=udp::1798-:1798,hostfwd=tcp::1798-:1798",
+    "-object", "filter-dump,id=filter2,netdev=e1000,file=e1000.pcap",
 
     # Network configuration rtl8139
     "-nic", "model=rtl8139,id=rtl8139,hostfwd=udp::1797-:1797,hostfwd=tcp::1797-:1797",
     "-object", "filter-dump,id=filter1,netdev=rtl8139,file=rtl8139.dump",
+
+    # Audio configuration (Using pulse audio for Linux)
+    "-audiodev", "id=audio0,driver=${QEMU_AUDIO_DEVICE}",
+]
+
+
+[tasks.qemu_mac]
+command = "sudo"
+dependencies = [ "image", "hdd", "ovmf" ]
+args = [
+    "-E",
+    "qemu-system-x86_64",
+    # Base machine configuration
+    "-machine", "q35,nvdimm=on,pcspk-audiodev=audio0",
+    "-m", "512M,slots=2,maxmem=1G",
+    "-cpu", "Haswell",
+    "-bios", "RELEASEX64_OVMF.fd",
+    "-boot", "d",
+    "-vga", "std",
+    "-rtc", "base=localtime",
+    "-serial", "stdio",
+
+    # Hard disk drive configuration
+    "-device", "piix3-ide,id=ide",  # IDE Controller
+    "-device", "ahci,id=ahci",      # AHCI Controller
+    "-drive", "driver=raw,if=none,id=boot,file.filename=d3os.img",  # Boot drive
+    "-drive", "driver=raw,if=none,id=hdd,file.filename=hdd.img",    # HDD drive containing root filesystem
+    "-device", "ide-hd,bus=ahci.0,drive=boot",  # Attach boot drive to AHCI controller (boots faster than on the IDE controller)
+    "-device", "ide-hd,bus=ide.0,drive=hdd",    # Attach HDD drive to IDE controller (D3OS does not support AHCI yet)
+
+    # NVDIMM configuration
+    "-device", "nvdimm,memdev=mem1,id=nv1,label-size=2M",
+    "-object", "memory-backend-file,id=mem1,share=on,mem-path=nvdimm0,size=16M",
+
+    # Network configuration e1000
+    # e1000 bridged via vmnet (macOS)
+    "-netdev", "vmnet-bridged,id=net0,ifname=en0",
+    "-device", "e1000,netdev=net0",
+    "-object", "filter-dump,id=filter_e1000,netdev=net0,file=netdump.pcap",
+
+
+    # Network configuration rtl8139
+    "-nic", "model=rtl8139,id=rtl8139,hostfwd=udp::1797-:1797,hostfwd=tcp::1797-:1797",
+    "-object", "filter-dump,id=filter1,netdev=rtl8139,file=rtl8139.pcap",
 
     # Audio configuration (Using pulse audio for Linux)
     "-audiodev", "id=audio0,driver=${QEMU_AUDIO_DEVICE}",
