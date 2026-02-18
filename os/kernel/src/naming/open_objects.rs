@@ -13,8 +13,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::result::Result;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use spin::rwlock::RwLock;
 use spin::Once;
+use spin::rwlock::RwLock;
 
 use super::lookup;
 use super::traits::NamedObject;
@@ -180,6 +180,11 @@ impl OpenObjectTable {
 
     /// Free handle
     fn free_handle(&self, handle: usize) -> SyscallResult {
+        // Bounds check first
+        if handle >= MAX_OPEN_OBJECTS {
+            return Err(Errno::EINVALH);
+        }
+
         let mut guard = self.open_handles.write();
 
         if let Some(idx) = guard.iter().position(|(h, _)| *h == handle) {

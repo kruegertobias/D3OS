@@ -9,14 +9,14 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use log::info;
-use x86_64::structures::paging::frame::PhysFrameRange;
-use x86_64::structures::paging::Page;
 use x86_64::VirtAddr;
+use x86_64::structures::paging::Page;
+use x86_64::structures::paging::frame::PhysFrameRange;
 
-use crate::memory::{vmm, MemorySpace};
 use crate::memory::vma::VmaType;
+use crate::memory::{MemorySpace, vmm};
 use crate::process::process::Process;
-use crate::scheduler;
+use crate::{network, scheduler};
 
 pub struct ProcessManager {
     active_processes: Vec<Arc<Process>>,
@@ -132,7 +132,7 @@ impl ProcessManager {
         self.exited_processes.push(process);
     }
 
-    /// 
+    ///
     pub fn drop_exited_process(&mut self) {
         self.exited_processes.clear();
     }
